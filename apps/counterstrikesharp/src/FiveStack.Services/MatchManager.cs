@@ -849,17 +849,23 @@ public class MatchManager
             return 10;
         }
 
-        if (_matchData.options.type == "Wingman")
+        // Prefer the actual roster so modes like Trios (3v3) do not fall through
+        // to the Competitive default of 10.
+        int rosterCount =
+            (_matchData.lineup_1?.lineup_players?.Count ?? 0)
+            + (_matchData.lineup_2?.lineup_players?.Count ?? 0);
+        if (rosterCount > 0)
         {
-            return 4;
+            return rosterCount;
         }
 
-        if (_matchData.options.type == "Duel")
+        return _matchData.options.type switch
         {
-            return 2;
-        }
-
-        return 10;
+            "Wingman" => 4,
+            "Duel" => 2,
+            "Trios" => 6,
+            _ => 10,
+        };
     }
 
     private void StartWarmup()
