@@ -31,6 +31,16 @@ public partial class FiveStackPlugin
             $"OnRoundStart totalRoundsPlayed={totalRoundsPlayed} isInPlay={isInPlay} isWarmup={isWarmup} isKnife={isKnife}"
         );
 
+        // Late reconnects during knife/live can miss the connect-time
+        // ChangeTeam; re-seat anyone who is not on their roster side.
+        if (isInPlay || isKnife || isWarmup)
+        {
+            foreach (var player in MatchUtility.Players())
+            {
+                matchManager.EnforceMemberTeam(player);
+            }
+        }
+
         if (!isInPlay)
         {
             return HookResult.Continue;

@@ -1149,42 +1149,55 @@ public class MatchManager
                 $"[team] Changing Team {player.Name} ({player.SteamID}) {currentTeam} -> {expectedTeam} (respawn: {shouldRespawn})"
             );
 
-            TimerUtility.AddTimer(
-                0.1f,
-                () =>
-                {
-                    if (!player.IsValid)
+            // Late joins during knife/live often miss a single early ChangeTeam
+            // while teamselect is disabled — retry until the side sticks.
+            float[] delays = { 0.1f, 0.5f, 1.0f, 2.0f };
+
+            foreach (float delay in delays)
+            {
+                float attemptDelay = delay;
+                TimerUtility.AddTimer(
+                    attemptDelay,
+                    () =>
                     {
-                        return;
-                    }
-
-                    player.ChangeTeam(expectedTeam);
-
-                    _logger.LogInformation(
-                        $"[team] ChangeTeam applied {player.Name} ({player.SteamID}) -> {expectedTeam}"
-                    );
-
-                    // Respawn only once the team change has landed. Respawning
-                    // first spawns the player while still unassigned, and the
-                    // weapons a spawn creates are what the inventory plugin
-                    // skins — a spawn on the wrong team wastes that one shot.
-                    if (shouldRespawn)
-                    {
-                        _core.Scheduler.NextTick(() =>
+                        if (!player.IsValid)
                         {
-                            if (!player.IsValid)
-                            {
-                                return;
-                            }
+                            return;
+                        }
 
-                            _logger.LogInformation(
-                                $"[team] Respawning {player.Name} ({player.SteamID}) after team change -> {expectedTeam}"
-                            );
-                            player.Respawn();
-                        });
+                        if (player.Controller.Team == expectedTeam)
+                        {
+                            return;
+                        }
+
+                        player.ChangeTeam(expectedTeam);
+
+                        _logger.LogInformation(
+                            $"[team] ChangeTeam applied {player.Name} ({player.SteamID}) -> {expectedTeam} (delay={attemptDelay}s, now={player.Controller.Team})"
+                        );
+
+                        // Respawn only once the team change has landed. Respawning
+                        // first spawns the player while still unassigned, and the
+                        // weapons a spawn creates are what the inventory plugin
+                        // skins — a spawn on the wrong team wastes that one shot.
+                        if (shouldRespawn && player.Controller.Team == expectedTeam)
+                        {
+                            _core.Scheduler.NextTick(() =>
+                            {
+                                if (!player.IsValid || player.Controller.Team != expectedTeam)
+                                {
+                                    return;
+                                }
+
+                                _logger.LogInformation(
+                                    $"[team] Respawning {player.Name} ({player.SteamID}) after team change -> {expectedTeam}"
+                                );
+                                player.Respawn();
+                            });
+                        }
                     }
-                }
-            );
+                );
+            }
 
             _gameServer.Message(
                 MessageType.Chat,

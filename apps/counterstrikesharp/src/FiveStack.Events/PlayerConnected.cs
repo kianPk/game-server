@@ -185,8 +185,17 @@ public partial class FiveStackPlugin
 
         CsTeam expectedTeam = match.GetExpectedTeam(player);
 
-        if (expectedTeam != CsTeam.None && joiningTeam != expectedTeam)
+        if (expectedTeam == CsTeam.None)
         {
+            return HookResult.Continue;
+        }
+
+        // jointeam 0 (auto) and wrong-side picks used to Hit Stop while
+        // sv_disable_teamselect_menu is on in knife/live — players got stuck
+        // unassigned with no way to pick. Force the roster side instead.
+        if (joiningTeam == CsTeam.None || joiningTeam != expectedTeam)
+        {
+            match.EnforceMemberTeam(player, CsTeam.None);
             return HookResult.Stop;
         }
 

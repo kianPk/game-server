@@ -189,8 +189,16 @@ public partial class FiveStackPlugin
 
         Team expectedTeam = match.GetExpectedTeam(player);
 
-        if (expectedTeam != Team.None && joiningTeam != expectedTeam)
+        if (expectedTeam == Team.None)
         {
+            return HookResult.Continue;
+        }
+
+        // jointeam 0 (auto) and wrong-side picks used to Hit Stop while
+        // teamselect is disabled in knife/live — players got stuck unassigned.
+        if (joiningTeam == Team.None || joiningTeam != expectedTeam)
+        {
+            match.EnforceMemberTeam(player, Team.None);
             return HookResult.Stop;
         }
 
