@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
+using CSSUtilities = CounterStrikeSharp.API.Utilities;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
@@ -1151,124 +1153,221 @@ public class MatchManager
             currentTeam = player.Team;
         }
 
-        bool shouldRespawn =
+        bool mayPlace =
             IsWarmup()
             || (MatchUtility.Rules()?.FreezePeriod == true) && expectedTeam != CsTeam.Spectator;
 
-        void RespawnOnceSettled(bool force = false)
+        // Engine Respawn alone re-picks the same bad pad (wall clip on Nuke T).
+        // After ChangeTeam we teleport onto a free info_player_* for that side.
+        void SeatAndPlace(float delay, bool announce)
         {
-            if (!player.IsValid || expectedTeam == CsTeam.Spectator)
-            {
-                return;
-            }
+            TimerUtility.AddTimer(
+                delay,
+                () =>
+                {
+                    if (!player.IsValid)
+                    {
+                        return;
+                    }
 
-            if (player.Team != expectedTeam)
-            {
-                return;
-            }
+                    if (player.Team != expectedTeam)
+                    {
+                        player.ChangeTeam(expectedTeam);
+                        _logger.LogInformation(
+                            $"[team] ChangeTeam applied {player.PlayerName} ({player.SteamID}) -> {expectedTeam} (delay={delay}s, now={player.Team})"
+                        );
+                    }
 
-            float now = Server.CurrentTime;
-            if (
-                !force
-                && LastForcedRespawnAt.TryGetValue(player.SteamID, out float last)
-                && now - last < 2.0f
-            )
-            {
-                return;
-            }
+                    if (!mayPlace || expectedTeam == CsTeam.Spectator)
+                    {
+                        return;
+                    }
 
-            LastForcedRespawnAt[player.SteamID] = now;
-            _logger.LogInformation(
-                $"[team] Respawning {player.PlayerName} ({player.SteamID}) on {expectedTeam} (force={force})"
+                    if (!player.PawnIsAlive)
+                    {
+                        float now = Server.CurrentTime;
+                        if (
+                            !LastForcedRespawnAt.TryGetValue(player.SteamID, out float last)
+                            || now - last >= 2.0f
+                        )
+                        {
+                            LastForcedRespawnAt[player.SteamID] = now;
+                            player.Respawn();
+                        }
+                    }
+
+                    // Next frame so pawn exists after ChangeTeam/Respawn.
+                    Server.NextFrame(() =>
+                    {
+                        TimerUtility.AddTimer(
+                            0.05f,
+                            () => TeleportToFreeTeamSpawn(player, expectedTeam)
+                        );
+                    });
+
+                    if (announce)
+                    {
+                        _gameServer.Message(
+                            HudDestination.Chat,
+                            $" You've been assigned to {(expectedTeam == CsTeam.Terrorist ? ChatColors.Gold : ChatColors.Blue)}{TeamUtility.CSTeamToString(expectedTeam)}.",
+                            player
+                        );
+                    }
+                }
             );
-            player.Respawn();
         }
 
         if (currentTeam != expectedTeam)
         {
             _logger.LogInformation(
-                $"[team] Changing Team {player.PlayerName} ({player.SteamID}) {currentTeam} -> {expectedTeam} (respawn: {shouldRespawn})"
+                $"[team] Changing Team {player.PlayerName} ({player.SteamID}) {currentTeam} -> {expectedTeam} (place: {mayPlace})"
             );
 
-            // Seat the side first; Respawn only after team + spawn anchors settle.
-            // A second "rescue" Respawn unsticks the rare wall/void first spawn.
-            float[] seatDelays = { 0.25f, 1.0f };
-
-            foreach (float delay in seatDelays)
-            {
-                float attemptDelay = delay;
-                TimerUtility.AddTimer(
-                    attemptDelay,
-                    () =>
-                    {
-                        if (!player.IsValid)
-                        {
-                            return;
-                        }
-
-                        if (player.Team != expectedTeam)
-                        {
-                            player.ChangeTeam(expectedTeam);
-                            _logger.LogInformation(
-                                $"[team] ChangeTeam applied {player.PlayerName} ({player.SteamID}) -> {expectedTeam} (delay={attemptDelay}s, now={player.Team})"
-                            );
-                        }
-                    }
-                );
-            }
-
-            if (shouldRespawn)
-            {
-                TimerUtility.AddTimer(
-                    0.7f,
-                    () =>
-                    {
-                        if (!player.IsValid)
-                        {
-                            return;
-                        }
-
-                        if (player.Team != expectedTeam)
-                        {
-                            player.ChangeTeam(expectedTeam);
-                        }
-
-                        RespawnOnceSettled();
-                    }
-                );
-
-                TimerUtility.AddTimer(
-                    1.6f,
-                    () =>
-                    {
-                        if (!player.IsValid || player.Team != expectedTeam)
-                        {
-                            return;
-                        }
-
-                        // Unstick players clipped into map geo on first seat.
-                        RespawnOnceSettled(force: true);
-                    }
-                );
-            }
-
-            _gameServer.Message(
-                HudDestination.Chat,
-                $" You've been assigned to {(expectedTeam == CsTeam.Terrorist ? ChatColors.Gold : ChatColors.Blue)}{TeamUtility.CSTeamToString(expectedTeam)}.",
-                player
-            );
+            SeatAndPlace(0.3f, announce: true);
+            // Second pass: late roster / jointeam races; re-teleport if still clipped.
+            SeatAndPlace(1.4f, announce: false);
         }
-        else if (shouldRespawn && !player.PawnIsAlive)
+        else if (mayPlace && !player.PawnIsAlive)
         {
-            // Already on the right side — only Respawn if dead. RoundStart
-            // re-enforce used to Respawn living players and shove them into walls.
-            Server.NextFrame(() =>
-            {
-                TimerUtility.AddTimer(0.4f, () => RespawnOnceSettled());
-            });
+            SeatAndPlace(0.35f, announce: false);
         }
 
         captainSystem.IsCaptain(player, expectedTeam);
+    }
+
+    /// <summary>
+    /// Place the pawn on a competitive spawn for <paramref name="team"/>.
+    /// Slot is stable by SteamID order among that side so two joins don't
+    /// collide on the same pad (engine Respawn often stacks them in a wall).
+    /// </summary>
+    private void TeleportToFreeTeamSpawn(CCSPlayerController player, CsTeam team)
+    {
+        if (!player.IsValid || team is CsTeam.None or CsTeam.Spectator)
+        {
+            return;
+        }
+
+        if (player.Team != team)
+        {
+            return;
+        }
+
+        string designer =
+            team == CsTeam.Terrorist
+                ? "info_player_terrorist"
+                : "info_player_counterterrorist";
+
+        var candidates = new List<(Vector Origin, QAngle Angles)>();
+        foreach (
+            CBaseEntity spawn in CSSUtilities.FindAllEntitiesByDesignerName<CBaseEntity>(designer)
+        )
+        {
+            Vector? origin = spawn.AbsOrigin;
+            if (origin == null)
+            {
+                continue;
+            }
+
+            QAngle rot = spawn.AbsRotation ?? new QAngle(0, 0, 0);
+            candidates.Add(
+                (
+                    new Vector(origin.X, origin.Y, origin.Z),
+                    new QAngle(rot.X, rot.Y, rot.Z)
+                )
+            );
+        }
+
+        if (candidates.Count == 0)
+        {
+            _logger.LogWarning(
+                $"[team] No {designer} entities to place {player.PlayerName} ({player.SteamID})"
+            );
+            return;
+        }
+
+        // Stable order so slot assignment is deterministic across calls.
+        candidates.Sort(
+            (a, b) =>
+            {
+                int cx = a.Origin.X.CompareTo(b.Origin.X);
+                if (cx != 0)
+                {
+                    return cx;
+                }
+
+                int cy = a.Origin.Y.CompareTo(b.Origin.Y);
+                if (cy != 0)
+                {
+                    return cy;
+                }
+
+                return a.Origin.Z.CompareTo(b.Origin.Z);
+            }
+        );
+
+        int slot = MatchUtility
+            .Players()
+            .Where(p => p.IsValid && !p.IsBot && p.Team == team)
+            .OrderBy(p => p.SteamID)
+            .TakeWhile(p => p.SteamID != player.SteamID)
+            .Count();
+
+        int index = slot % candidates.Count;
+        (Vector Origin, QAngle Angles) pick = candidates[index];
+
+        // If that pad is already occupied, walk forward to the next free one.
+        for (int step = 0; step < candidates.Count; step++)
+        {
+            int i = (index + step) % candidates.Count;
+            Vector origin = candidates[i].Origin;
+            bool occupied = false;
+
+            foreach (CCSPlayerController other in MatchUtility.Players())
+            {
+                if (
+                    !other.IsValid
+                    || other.SteamID == player.SteamID
+                    || !other.PawnIsAlive
+                )
+                {
+                    continue;
+                }
+
+                Vector? o = other.PlayerPawn?.Value?.AbsOrigin;
+                if (o == null)
+                {
+                    continue;
+                }
+
+                float dx = o.X - origin.X;
+                float dy = o.Y - origin.Y;
+                float dz = o.Z - origin.Z;
+                if (dx * dx + dy * dy + dz * dz < 48f * 48f)
+                {
+                    occupied = true;
+                    break;
+                }
+            }
+
+            if (!occupied)
+            {
+                pick = candidates[i];
+                index = i;
+                break;
+            }
+        }
+
+        CCSPlayerPawn? pawn = player.PlayerPawn?.Value;
+        if (pawn == null || !pawn.IsValid)
+        {
+            return;
+        }
+
+        _logger.LogInformation(
+            $"[team] Teleport {player.PlayerName} ({player.SteamID}) to {team} spawn#{index} ({pick.Origin.X:F0},{pick.Origin.Y:F0},{pick.Origin.Z:F0})"
+        );
+
+        pawn.Teleport(pick.Origin, pick.Angles, new Vector(0, 0, 0));
     }
 
     public CsTeam GetExpectedTeam(CCSPlayerController player)
