@@ -94,7 +94,7 @@ public partial class FiveStackPlugin
         // on one side before roster sides settle. Read real team after a beat.
         CCSPlayerController connecting = player;
         TimerUtility.AddTimer(
-            0.45f,
+            0.55f,
             () =>
             {
                 if (!connecting.IsValid)

@@ -1155,7 +1155,7 @@ public class MatchManager
             IsWarmup()
             || (MatchUtility.Rules()?.FreezePeriod == true) && expectedTeam != CsTeam.Spectator;
 
-        void RespawnOnceSettled()
+        void RespawnOnceSettled(bool force = false)
         {
             if (!player.IsValid || expectedTeam == CsTeam.Spectator)
             {
@@ -1169,7 +1169,8 @@ public class MatchManager
 
             float now = Server.CurrentTime;
             if (
-                LastForcedRespawnAt.TryGetValue(player.SteamID, out float last)
+                !force
+                && LastForcedRespawnAt.TryGetValue(player.SteamID, out float last)
                 && now - last < 2.0f
             )
             {
@@ -1178,7 +1179,7 @@ public class MatchManager
 
             LastForcedRespawnAt[player.SteamID] = now;
             _logger.LogInformation(
-                $"[team] Respawning {player.PlayerName} ({player.SteamID}) on {expectedTeam}"
+                $"[team] Respawning {player.PlayerName} ({player.SteamID}) on {expectedTeam} (force={force})"
             );
             player.Respawn();
         }
@@ -1189,11 +1190,11 @@ public class MatchManager
                 $"[team] Changing Team {player.PlayerName} ({player.SteamID}) {currentTeam} -> {expectedTeam} (respawn: {shouldRespawn})"
             );
 
-            // Late joins / jointeam 0 while teamselect is disabled need retries.
-            // Keep InitConnect untouched — only soft-delay Respawn after team lands.
-            float[] delays = { 0.15f, 0.75f, 1.5f };
+            // Seat the side first; Respawn only after team + spawn anchors settle.
+            // A second "rescue" Respawn unsticks the rare wall/void first spawn.
+            float[] seatDelays = { 0.25f, 1.0f };
 
-            foreach (float delay in delays)
+            foreach (float delay in seatDelays)
             {
                 float attemptDelay = delay;
                 TimerUtility.AddTimer(
@@ -1212,32 +1213,41 @@ public class MatchManager
                                 $"[team] ChangeTeam applied {player.PlayerName} ({player.SteamID}) -> {expectedTeam} (delay={attemptDelay}s, now={player.Team})"
                             );
                         }
+                    }
+                );
+            }
 
-                        if (!shouldRespawn)
+            if (shouldRespawn)
+            {
+                TimerUtility.AddTimer(
+                    0.7f,
+                    () =>
+                    {
+                        if (!player.IsValid)
                         {
                             return;
                         }
 
-                        Server.NextFrame(() =>
+                        if (player.Team != expectedTeam)
                         {
-                            TimerUtility.AddTimer(
-                                0.2f,
-                                () =>
-                                {
-                                    if (!player.IsValid)
-                                    {
-                                        return;
-                                    }
+                            player.ChangeTeam(expectedTeam);
+                        }
 
-                                    if (player.Team != expectedTeam)
-                                    {
-                                        player.ChangeTeam(expectedTeam);
-                                    }
+                        RespawnOnceSettled();
+                    }
+                );
 
-                                    RespawnOnceSettled();
-                                }
-                            );
-                        });
+                TimerUtility.AddTimer(
+                    1.6f,
+                    () =>
+                    {
+                        if (!player.IsValid || player.Team != expectedTeam)
+                        {
+                            return;
+                        }
+
+                        // Unstick players clipped into map geo on first seat.
+                        RespawnOnceSettled(force: true);
                     }
                 );
             }
@@ -1248,12 +1258,13 @@ public class MatchManager
                 player
             );
         }
-        else if (shouldRespawn)
+        else if (shouldRespawn && !player.PawnIsAlive)
         {
-            // Immediate Respawn on connect-full races spawn anchors (wall / void).
+            // Already on the right side — only Respawn if dead. RoundStart
+            // re-enforce used to Respawn living players and shove them into walls.
             Server.NextFrame(() =>
             {
-                TimerUtility.AddTimer(0.35f, RespawnOnceSettled);
+                TimerUtility.AddTimer(0.4f, () => RespawnOnceSettled());
             });
         }
 
