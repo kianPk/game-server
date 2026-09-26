@@ -875,8 +875,9 @@ public class MatchManager
 
     private void StartWarmup()
     {
-        ConVar.Find("sv_disable_teamselect_menu")?.SetValue(false);
-        _gameServer.SendCommands(["exec 5stack.warmup.cfg"]);
+        // Ranked lineups assign sides — never show the team-select / side picker.
+        ConVar.Find("sv_disable_teamselect_menu")?.SetValue(true);
+        _gameServer.SendCommands(["exec 5stack.warmup.cfg", "mp_force_pick_time 0"]);
 
         knifeSystem.Reset();
 

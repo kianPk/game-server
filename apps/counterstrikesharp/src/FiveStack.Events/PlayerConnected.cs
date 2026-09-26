@@ -2,6 +2,7 @@ using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
 using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Utils;
 using FiveStack.Entities;
 using FiveStack.Utilities;
@@ -89,22 +90,25 @@ public partial class FiveStackPlugin
             return HookResult.Continue;
         }
 
-        // Defer team seat: EnforceMemberTeam(…, None) + immediate Respawn on
-        // connect-full drops players in walls / under the map and can seat two
-        // on one side before roster sides settle. Read real team after a beat.
+        // Seat ASAP so the side-picker never appears; spawn pad is still
+        // staggered inside the team-seat queue (jointeam / SwitchTeam).
         CCSPlayerController connecting = player;
-        TimerUtility.AddTimer(
-            0.55f,
-            () =>
+        Server.NextFrame(() =>
+        {
+            if (!connecting.IsValid)
             {
-                if (!connecting.IsValid)
-                {
-                    return;
-                }
-
-                _matchService.GetCurrentMatch()?.EnforceMemberTeam(connecting);
+                return;
             }
-        );
+
+            MatchManager? current = _matchService.GetCurrentMatch();
+            if (current == null)
+            {
+                return;
+            }
+
+            ConVar.Find("sv_disable_teamselect_menu")?.SetValue(true);
+            current.EnforceMemberTeam(connecting);
+        });
 
         _matchEvents.PublishGameEvent(
             "player-connected",
