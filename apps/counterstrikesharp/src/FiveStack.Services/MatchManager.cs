@@ -1,10 +1,8 @@
 using System.Collections.Concurrent;
-using System.Linq;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
-using CSSUtilities = CounterStrikeSharp.API.Utilities;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
@@ -1153,13 +1151,14 @@ public class MatchManager
             currentTeam = player.Team;
         }
 
-        bool mayPlace =
+        // Warmup/freeze: ChangeTeam already seats the pawn. Do NOT teleport onto
+        // raw info_player_* (Nuke ships pads under floor / outside Hell). Do NOT
+        // Respawn storms — those clip into walls. Only Respawn if still dead.
+        bool mayRespawnIfDead =
             IsWarmup()
             || (MatchUtility.Rules()?.FreezePeriod == true) && expectedTeam != CsTeam.Spectator;
 
-        // Engine Respawn alone re-picks the same bad pad (wall clip on Nuke T).
-        // After ChangeTeam we teleport onto a free info_player_* for that side.
-        void SeatAndPlace(float delay, bool announce)
+        void ApplyChangeTeam(float delay, bool announce)
         {
             TimerUtility.AddTimer(
                 delay,
@@ -1178,32 +1177,21 @@ public class MatchManager
                         );
                     }
 
-                    if (!mayPlace || expectedTeam == CsTeam.Spectator)
-                    {
-                        return;
-                    }
-
-                    if (!player.PawnIsAlive)
+                    if (mayRespawnIfDead && !player.PawnIsAlive && expectedTeam != CsTeam.Spectator)
                     {
                         float now = Server.CurrentTime;
                         if (
                             !LastForcedRespawnAt.TryGetValue(player.SteamID, out float last)
-                            || now - last >= 2.0f
+                            || now - last >= 2.5f
                         )
                         {
                             LastForcedRespawnAt[player.SteamID] = now;
+                            _logger.LogInformation(
+                                $"[team] Respawn (dead) {player.PlayerName} ({player.SteamID}) on {expectedTeam}"
+                            );
                             player.Respawn();
                         }
                     }
-
-                    // Next frame so pawn exists after ChangeTeam/Respawn.
-                    Server.NextFrame(() =>
-                    {
-                        TimerUtility.AddTimer(
-                            0.05f,
-                            () => TeleportToFreeTeamSpawn(player, expectedTeam)
-                        );
-                    });
 
                     if (announce)
                     {
@@ -1220,154 +1208,19 @@ public class MatchManager
         if (currentTeam != expectedTeam)
         {
             _logger.LogInformation(
-                $"[team] Changing Team {player.PlayerName} ({player.SteamID}) {currentTeam} -> {expectedTeam} (place: {mayPlace})"
+                $"[team] Changing Team {player.PlayerName} ({player.SteamID}) {currentTeam} -> {expectedTeam}"
             );
 
-            SeatAndPlace(0.3f, announce: true);
-            // Second pass: late roster / jointeam races; re-teleport if still clipped.
-            SeatAndPlace(1.4f, announce: false);
+            ApplyChangeTeam(0.25f, announce: true);
+            // Late jointeam / roster race — team only, no second Respawn if alive.
+            ApplyChangeTeam(1.0f, announce: false);
         }
-        else if (mayPlace && !player.PawnIsAlive)
+        else if (mayRespawnIfDead && !player.PawnIsAlive)
         {
-            SeatAndPlace(0.35f, announce: false);
+            ApplyChangeTeam(0.35f, announce: false);
         }
 
         captainSystem.IsCaptain(player, expectedTeam);
-    }
-
-    /// <summary>
-    /// Place the pawn on a competitive spawn for <paramref name="team"/>.
-    /// Slot is stable by SteamID order among that side so two joins don't
-    /// collide on the same pad (engine Respawn often stacks them in a wall).
-    /// </summary>
-    private void TeleportToFreeTeamSpawn(CCSPlayerController player, CsTeam team)
-    {
-        if (!player.IsValid || team is CsTeam.None or CsTeam.Spectator)
-        {
-            return;
-        }
-
-        if (player.Team != team)
-        {
-            return;
-        }
-
-        string designer =
-            team == CsTeam.Terrorist
-                ? "info_player_terrorist"
-                : "info_player_counterterrorist";
-
-        var candidates = new List<(Vector Origin, QAngle Angles)>();
-        foreach (
-            CBaseEntity spawn in CSSUtilities.FindAllEntitiesByDesignerName<CBaseEntity>(designer)
-        )
-        {
-            Vector? origin = spawn.AbsOrigin;
-            if (origin == null)
-            {
-                continue;
-            }
-
-            QAngle rot = spawn.AbsRotation ?? new QAngle(0, 0, 0);
-            candidates.Add(
-                (
-                    new Vector(origin.X, origin.Y, origin.Z),
-                    new QAngle(rot.X, rot.Y, rot.Z)
-                )
-            );
-        }
-
-        if (candidates.Count == 0)
-        {
-            _logger.LogWarning(
-                $"[team] No {designer} entities to place {player.PlayerName} ({player.SteamID})"
-            );
-            return;
-        }
-
-        // Stable order so slot assignment is deterministic across calls.
-        candidates.Sort(
-            (a, b) =>
-            {
-                int cx = a.Origin.X.CompareTo(b.Origin.X);
-                if (cx != 0)
-                {
-                    return cx;
-                }
-
-                int cy = a.Origin.Y.CompareTo(b.Origin.Y);
-                if (cy != 0)
-                {
-                    return cy;
-                }
-
-                return a.Origin.Z.CompareTo(b.Origin.Z);
-            }
-        );
-
-        int slot = MatchUtility
-            .Players()
-            .Where(p => p.IsValid && !p.IsBot && p.Team == team)
-            .OrderBy(p => p.SteamID)
-            .TakeWhile(p => p.SteamID != player.SteamID)
-            .Count();
-
-        int index = slot % candidates.Count;
-        (Vector Origin, QAngle Angles) pick = candidates[index];
-
-        // If that pad is already occupied, walk forward to the next free one.
-        for (int step = 0; step < candidates.Count; step++)
-        {
-            int i = (index + step) % candidates.Count;
-            Vector origin = candidates[i].Origin;
-            bool occupied = false;
-
-            foreach (CCSPlayerController other in MatchUtility.Players())
-            {
-                if (
-                    !other.IsValid
-                    || other.SteamID == player.SteamID
-                    || !other.PawnIsAlive
-                )
-                {
-                    continue;
-                }
-
-                Vector? o = other.PlayerPawn?.Value?.AbsOrigin;
-                if (o == null)
-                {
-                    continue;
-                }
-
-                float dx = o.X - origin.X;
-                float dy = o.Y - origin.Y;
-                float dz = o.Z - origin.Z;
-                if (dx * dx + dy * dy + dz * dz < 48f * 48f)
-                {
-                    occupied = true;
-                    break;
-                }
-            }
-
-            if (!occupied)
-            {
-                pick = candidates[i];
-                index = i;
-                break;
-            }
-        }
-
-        CCSPlayerPawn? pawn = player.PlayerPawn?.Value;
-        if (pawn == null || !pawn.IsValid)
-        {
-            return;
-        }
-
-        _logger.LogInformation(
-            $"[team] Teleport {player.PlayerName} ({player.SteamID}) to {team} spawn#{index} ({pick.Origin.X:F0},{pick.Origin.Y:F0},{pick.Origin.Z:F0})"
-        );
-
-        pawn.Teleport(pick.Origin, pick.Angles, new Vector(0, 0, 0));
     }
 
     public CsTeam GetExpectedTeam(CCSPlayerController player)

@@ -30,9 +30,9 @@ public partial class FiveStackPlugin
             $"OnRoundStart totalRoundsPlayed={totalRoundsPlayed} isInPlay={isInPlay} isWarmup={isWarmup} isKnife={isKnife}"
         );
 
-        // Re-seat anyone off their roster side (warmup/knife/live). Respawn is
-        // debounced inside EnforceMemberTeam.
-        if (isInPlay || isKnife || isWarmup)
+        // Re-seat wrong roster side during knife/live only. Warmup re-enforce
+        // was fighting connect seating and shoving people into bad pads.
+        if (isInPlay || isKnife)
         {
             foreach (var player in MatchUtility.Players())
             {
