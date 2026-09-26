@@ -193,14 +193,14 @@ public partial class FiveStackPlugin
             return HookResult.Continue;
         }
 
-        // Stock 420 only Stop'd wrong jointeam — players stuck unassigned or on
-        // the wrong side until leave/rejoin. Force roster side instead.
-        if (joiningTeam == CsTeam.None || joiningTeam != expectedTeam)
+        // Stock Stop'd wrong jointeam without seating — leave/rejoin. MatchZy
+        // only Stops; we queue a SwitchTeam/jointeam seat (never ChangeTeam).
+        if (joiningTeam == expectedTeam)
         {
-            match.EnforceMemberTeam(player);
-            return HookResult.Stop;
+            return HookResult.Continue;
         }
 
-        return HookResult.Continue;
+        match.EnforceMemberTeam(player);
+        return HookResult.Stop;
     }
 }

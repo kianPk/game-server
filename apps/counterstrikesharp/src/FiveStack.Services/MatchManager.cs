@@ -22,7 +22,11 @@ public class MatchManager
     // auto-restart stays behind the plugin's stop-recording + demo-upload flow.
     private const int DemoUploadRestartBufferSeconds = 300;
 
-    // First-connect Respawn storms place the pawn in walls / under the map.
+    // First-connect ChangeTeam/Respawn storms place the pawn in walls.
+    // Seat via jointeam (from None/spec) or SwitchTeam, one player at a time.
+    private static readonly ConcurrentQueue<ulong> TeamSeatQueue = new();
+    private static readonly ConcurrentDictionary<ulong, byte> TeamSeatQueued = new();
+    private static int TeamSeatWorkerRunning = 0;
     private static readonly ConcurrentDictionary<ulong, float> LastForcedRespawnAt = new();
 
     private MatchData? _matchData;
@@ -1141,7 +1145,7 @@ public class MatchManager
     {
         CsTeam expectedTeam = GetExpectedTeam(player);
 
-        if (expectedTeam == CsTeam.None)
+        if (expectedTeam == CsTeam.None || expectedTeam == CsTeam.Spectator)
         {
             return;
         }
@@ -1151,76 +1155,146 @@ public class MatchManager
             currentTeam = player.Team;
         }
 
-        // Warmup/freeze: ChangeTeam already seats the pawn. Do NOT teleport onto
-        // raw info_player_* (Nuke ships pads under floor / outside Hell). Do NOT
-        // Respawn storms — those clip into walls. Only Respawn if still dead.
-        bool mayRespawnIfDead =
-            IsWarmup()
-            || (MatchUtility.Rules()?.FreezePeriod == true) && expectedTeam != CsTeam.Spectator;
-
-        void ApplyChangeTeam(float delay, bool announce)
+        if (currentTeam == expectedTeam)
         {
-            TimerUtility.AddTimer(
-                delay,
-                () =>
+            captainSystem.IsCaptain(player, expectedTeam);
+            return;
+        }
+
+        _logger.LogInformation(
+            $"[team] Queue seat {player.PlayerName} ({player.SteamID}) {currentTeam} -> {expectedTeam}"
+        );
+
+        QueueTeamSeat(player.SteamID);
+        captainSystem.IsCaptain(player, expectedTeam);
+    }
+
+    private void QueueTeamSeat(ulong steamId)
+    {
+        if (!TeamSeatQueued.TryAdd(steamId, 0))
+        {
+            return;
+        }
+
+        TeamSeatQueue.Enqueue(steamId);
+        EnsureTeamSeatWorker();
+    }
+
+    private void EnsureTeamSeatWorker()
+    {
+        if (System.Threading.Interlocked.CompareExchange(ref TeamSeatWorkerRunning, 1, 0) != 0)
+        {
+            return;
+        }
+
+        ProcessTeamSeatQueue();
+    }
+
+    private void ProcessTeamSeatQueue()
+    {
+        if (!TeamSeatQueue.TryDequeue(out ulong steamId))
+        {
+            System.Threading.Interlocked.Exchange(ref TeamSeatWorkerRunning, 0);
+            if (!TeamSeatQueue.IsEmpty)
+            {
+                EnsureTeamSeatWorker();
+            }
+
+            return;
+        }
+
+        TeamSeatQueued.TryRemove(steamId, out _);
+
+        CCSPlayerController? player = null;
+        foreach (CCSPlayerController p in MatchUtility.Players())
+        {
+            if (p.IsValid && p.SteamID == steamId)
+            {
+                player = p;
+                break;
+            }
+        }
+
+        if (player != null)
+        {
+            ApplyTeamSeat(player);
+        }
+
+        // Stagger so two joins don't land on the same Nuke pad in one frame.
+        TimerUtility.AddTimer(0.9f, ProcessTeamSeatQueue);
+    }
+
+    /// <summary>
+    /// MatchZy-style seat: native jointeam from None/spec (proper spawn),
+    /// SwitchTeam + one warmup Respawn when already on the other side.
+    /// Never ChangeTeam for T/CT — that is what clips into walls.
+    /// </summary>
+    private void ApplyTeamSeat(CCSPlayerController player)
+    {
+        CsTeam expectedTeam = GetExpectedTeam(player);
+
+        if (!player.IsValid || expectedTeam == CsTeam.None || expectedTeam == CsTeam.Spectator)
+        {
+            return;
+        }
+
+        if (player.Team == expectedTeam)
+        {
+            return;
+        }
+
+        CsTeam from = player.Team;
+        bool mayRespawn =
+            IsWarmup()
+            || (MatchUtility.Rules()?.FreezePeriod == true);
+
+        if (from == CsTeam.None || from == CsTeam.Spectator)
+        {
+            _logger.LogInformation(
+                $"[team] jointeam {(int)expectedTeam} for {player.PlayerName} ({player.SteamID}) from {from}"
+            );
+            // Engine jointeam picks a free competitive pad; ChangeTeam does not.
+            player.ExecuteClientCommand($"jointeam {(int)expectedTeam}");
+        }
+        else
+        {
+            _logger.LogInformation(
+                $"[team] SwitchTeam {from} -> {expectedTeam} for {player.PlayerName} ({player.SteamID})"
+            );
+            player.SwitchTeam(expectedTeam);
+
+            if (mayRespawn)
+            {
+                Server.NextFrame(() =>
                 {
-                    if (!player.IsValid)
+                    if (!player.IsValid || player.Team != expectedTeam)
                     {
                         return;
                     }
 
-                    if (player.Team != expectedTeam)
+                    float now = Server.CurrentTime;
+                    if (
+                        LastForcedRespawnAt.TryGetValue(player.SteamID, out float last)
+                        && now - last < 2.5f
+                    )
                     {
-                        player.ChangeTeam(expectedTeam);
-                        _logger.LogInformation(
-                            $"[team] ChangeTeam applied {player.PlayerName} ({player.SteamID}) -> {expectedTeam} (delay={delay}s, now={player.Team})"
-                        );
+                        return;
                     }
 
-                    if (mayRespawnIfDead && !player.PawnIsAlive && expectedTeam != CsTeam.Spectator)
-                    {
-                        float now = Server.CurrentTime;
-                        if (
-                            !LastForcedRespawnAt.TryGetValue(player.SteamID, out float last)
-                            || now - last >= 2.5f
-                        )
-                        {
-                            LastForcedRespawnAt[player.SteamID] = now;
-                            _logger.LogInformation(
-                                $"[team] Respawn (dead) {player.PlayerName} ({player.SteamID}) on {expectedTeam}"
-                            );
-                            player.Respawn();
-                        }
-                    }
-
-                    if (announce)
-                    {
-                        _gameServer.Message(
-                            HudDestination.Chat,
-                            $" You've been assigned to {(expectedTeam == CsTeam.Terrorist ? ChatColors.Gold : ChatColors.Blue)}{TeamUtility.CSTeamToString(expectedTeam)}.",
-                            player
-                        );
-                    }
-                }
-            );
+                    LastForcedRespawnAt[player.SteamID] = now;
+                    _logger.LogInformation(
+                        $"[team] Respawn after SwitchTeam {player.PlayerName} ({player.SteamID})"
+                    );
+                    player.Respawn();
+                });
+            }
         }
 
-        if (currentTeam != expectedTeam)
-        {
-            _logger.LogInformation(
-                $"[team] Changing Team {player.PlayerName} ({player.SteamID}) {currentTeam} -> {expectedTeam}"
-            );
-
-            ApplyChangeTeam(0.25f, announce: true);
-            // Late jointeam / roster race — team only, no second Respawn if alive.
-            ApplyChangeTeam(1.0f, announce: false);
-        }
-        else if (mayRespawnIfDead && !player.PawnIsAlive)
-        {
-            ApplyChangeTeam(0.35f, announce: false);
-        }
-
-        captainSystem.IsCaptain(player, expectedTeam);
+        _gameServer.Message(
+            HudDestination.Chat,
+            $" You've been assigned to {(expectedTeam == CsTeam.Terrorist ? ChatColors.Gold : ChatColors.Blue)}{TeamUtility.CSTeamToString(expectedTeam)}.",
+            player
+        );
     }
 
     public CsTeam GetExpectedTeam(CCSPlayerController player)
