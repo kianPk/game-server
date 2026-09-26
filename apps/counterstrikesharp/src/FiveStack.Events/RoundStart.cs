@@ -30,6 +30,16 @@ public partial class FiveStackPlugin
             $"OnRoundStart totalRoundsPlayed={totalRoundsPlayed} isInPlay={isInPlay} isWarmup={isWarmup} isKnife={isKnife}"
         );
 
+        // Re-seat anyone off their roster side (warmup/knife/live). Respawn is
+        // debounced inside EnforceMemberTeam.
+        if (isInPlay || isKnife || isWarmup)
+        {
+            foreach (var player in MatchUtility.Players())
+            {
+                matchManager.EnforceMemberTeam(player);
+            }
+        }
+
         if (!isInPlay)
         {
             return HookResult.Continue;

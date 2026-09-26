@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using CounterStrikeSharp.API;
@@ -20,6 +21,9 @@ public class MatchManager
     // Extra seconds added to mp_match_restart_delay on dedicated servers so CS2's
     // auto-restart stays behind the plugin's stop-recording + demo-upload flow.
     private const int DemoUploadRestartBufferSeconds = 300;
+
+    // First-connect Respawn storms place the pawn in walls / under the map.
+    private static readonly ConcurrentDictionary<ulong, float> LastForcedRespawnAt = new();
 
     private MatchData? _matchData;
     private eMapStatus _currentMapStatus = eMapStatus.Unknown;
@@ -1151,48 +1155,92 @@ public class MatchManager
             IsWarmup()
             || (MatchUtility.Rules()?.FreezePeriod == true) && expectedTeam != CsTeam.Spectator;
 
+        void RespawnOnceSettled()
+        {
+            if (!player.IsValid || expectedTeam == CsTeam.Spectator)
+            {
+                return;
+            }
+
+            if (player.Team != expectedTeam)
+            {
+                return;
+            }
+
+            float now = Server.CurrentTime;
+            if (
+                LastForcedRespawnAt.TryGetValue(player.SteamID, out float last)
+                && now - last < 2.0f
+            )
+            {
+                return;
+            }
+
+            LastForcedRespawnAt[player.SteamID] = now;
+            _logger.LogInformation(
+                $"[team] Respawning {player.PlayerName} ({player.SteamID}) on {expectedTeam}"
+            );
+            player.Respawn();
+        }
+
         if (currentTeam != expectedTeam)
         {
             _logger.LogInformation(
                 $"[team] Changing Team {player.PlayerName} ({player.SteamID}) {currentTeam} -> {expectedTeam} (respawn: {shouldRespawn})"
             );
 
-            TimerUtility.AddTimer(
-                0.1f,
-                () =>
-                {
-                    if (!player.IsValid)
+            // Late joins / jointeam 0 while teamselect is disabled need retries.
+            // Keep InitConnect untouched — only soft-delay Respawn after team lands.
+            float[] delays = { 0.15f, 0.75f, 1.5f };
+
+            foreach (float delay in delays)
+            {
+                float attemptDelay = delay;
+                TimerUtility.AddTimer(
+                    attemptDelay,
+                    () =>
                     {
-                        return;
-                    }
+                        if (!player.IsValid)
+                        {
+                            return;
+                        }
 
-                    player.ChangeTeam(expectedTeam);
+                        if (player.Team != expectedTeam)
+                        {
+                            player.ChangeTeam(expectedTeam);
+                            _logger.LogInformation(
+                                $"[team] ChangeTeam applied {player.PlayerName} ({player.SteamID}) -> {expectedTeam} (delay={attemptDelay}s, now={player.Team})"
+                            );
+                        }
 
-                    _logger.LogInformation(
-                        $"[team] ChangeTeam applied {player.PlayerName} ({player.SteamID}) -> {expectedTeam}"
-                    );
+                        if (!shouldRespawn)
+                        {
+                            return;
+                        }
 
-                    // Respawn only once the team change has landed. Respawning
-                    // first spawns the player while still unassigned, and the
-                    // weapons a spawn creates are what the inventory plugin
-                    // skins — a spawn on the wrong team wastes that one shot.
-                    if (shouldRespawn)
-                    {
                         Server.NextFrame(() =>
                         {
-                            if (!player.IsValid)
-                            {
-                                return;
-                            }
+                            TimerUtility.AddTimer(
+                                0.2f,
+                                () =>
+                                {
+                                    if (!player.IsValid)
+                                    {
+                                        return;
+                                    }
 
-                            _logger.LogInformation(
-                                $"[team] Respawning {player.PlayerName} ({player.SteamID}) after team change -> {expectedTeam}"
+                                    if (player.Team != expectedTeam)
+                                    {
+                                        player.ChangeTeam(expectedTeam);
+                                    }
+
+                                    RespawnOnceSettled();
+                                }
                             );
-                            player.Respawn();
                         });
                     }
-                }
-            );
+                );
+            }
 
             _gameServer.Message(
                 HudDestination.Chat,
@@ -1202,10 +1250,11 @@ public class MatchManager
         }
         else if (shouldRespawn)
         {
-            _logger.LogInformation(
-                $"[team] Respawning {player.PlayerName} ({player.SteamID}) (already on {expectedTeam})"
-            );
-            player.Respawn();
+            // Immediate Respawn on connect-full races spawn anchors (wall / void).
+            Server.NextFrame(() =>
+            {
+                TimerUtility.AddTimer(0.35f, RespawnOnceSettled);
+            });
         }
 
         captainSystem.IsCaptain(player, expectedTeam);

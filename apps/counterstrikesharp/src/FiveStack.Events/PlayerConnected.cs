@@ -89,7 +89,22 @@ public partial class FiveStackPlugin
             return HookResult.Continue;
         }
 
-        match.EnforceMemberTeam(player, CsTeam.None);
+        // Defer team seat: EnforceMemberTeam(…, None) + immediate Respawn on
+        // connect-full drops players in walls / under the map and can seat two
+        // on one side before roster sides settle. Read real team after a beat.
+        CCSPlayerController connecting = player;
+        TimerUtility.AddTimer(
+            0.45f,
+            () =>
+            {
+                if (!connecting.IsValid)
+                {
+                    return;
+                }
+
+                _matchService.GetCurrentMatch()?.EnforceMemberTeam(connecting);
+            }
+        );
 
         _matchEvents.PublishGameEvent(
             "player-connected",
@@ -173,8 +188,16 @@ public partial class FiveStackPlugin
 
         CsTeam expectedTeam = match.GetExpectedTeam(player);
 
-        if (expectedTeam != CsTeam.None && joiningTeam != expectedTeam)
+        if (expectedTeam == CsTeam.None)
         {
+            return HookResult.Continue;
+        }
+
+        // Stock 420 only Stop'd wrong jointeam — players stuck unassigned or on
+        // the wrong side until leave/rejoin. Force roster side instead.
+        if (joiningTeam == CsTeam.None || joiningTeam != expectedTeam)
+        {
+            match.EnforceMemberTeam(player);
             return HookResult.Stop;
         }
 
