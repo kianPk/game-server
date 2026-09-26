@@ -27,6 +27,7 @@ public class MatchManager
     private static readonly ConcurrentQueue<ulong> TeamSeatQueue = new();
     private static readonly ConcurrentDictionary<ulong, byte> TeamSeatQueued = new();
     private static int TeamSeatWorkerRunning = 0;
+    private static readonly ConcurrentDictionary<ulong, byte> ForcedJointeamAllow = new();
     private static readonly ConcurrentDictionary<ulong, float> LastForcedRespawnAt = new();
 
     private MatchData? _matchData;
@@ -1169,6 +1170,14 @@ public class MatchManager
         captainSystem.IsCaptain(player, expectedTeam);
     }
 
+    /// <summary>
+    /// True while ApplyTeamSeat is issuing the roster jointeam (not a player menu pick).
+    /// </summary>
+    public bool TryConsumeForcedJointeam(ulong steamId)
+    {
+        return ForcedJointeamAllow.TryRemove(steamId, out _);
+    }
+
     private void QueueTeamSeat(ulong steamId)
     {
         if (!TeamSeatQueued.TryAdd(steamId, 0))
@@ -1253,8 +1262,16 @@ public class MatchManager
             _logger.LogInformation(
                 $"[team] jointeam {(int)expectedTeam} for {player.PlayerName} ({player.SteamID}) from {from}"
             );
-            // Engine jointeam picks a free competitive pad; ChangeTeam does not.
+            // Only this path may pass HandleJoinTeam — blocks manual team menu picks.
+            ForcedJointeamAllow[player.SteamID] = 0;
             player.ExecuteClientCommand($"jointeam {(int)expectedTeam}");
+            TimerUtility.AddTimer(
+                1.0f,
+                () =>
+                {
+                    ForcedJointeamAllow.TryRemove(player.SteamID, out _);
+                }
+            );
         }
         else
         {

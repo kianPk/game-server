@@ -135,6 +135,17 @@ public partial class FiveStackPlugin
 
         CCSPlayerController player = @event.Userid;
 
+        CsTeam expectedTeam = match.GetExpectedTeam(player);
+        if (
+            expectedTeam != CsTeam.None
+            && expectedTeam != CsTeam.Spectator
+            && player.Team != expectedTeam
+        )
+        {
+            // Team menu / late swap — push back onto roster side.
+            match.EnforceMemberTeam(player);
+        }
+
         if (_readySystem.IsWaitingForReady())
         {
             _gameServer.Message(
@@ -193,9 +204,12 @@ public partial class FiveStackPlugin
             return HookResult.Continue;
         }
 
-        // Stock Stop'd wrong jointeam without seating — leave/rejoin. MatchZy
-        // only Stops; we queue a SwitchTeam/jointeam seat (never ChangeTeam).
-        if (joiningTeam == expectedTeam)
+        // Block the team-select menu. Only our forced jointeam (roster seat) may
+        // continue; any manual pick is stopped and we re-queue the roster side.
+        if (
+            joiningTeam == expectedTeam
+            && match.TryConsumeForcedJointeam(player.SteamID)
+        )
         {
             return HookResult.Continue;
         }
