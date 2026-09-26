@@ -101,7 +101,23 @@ public partial class FiveStackPlugin
             return HookResult.Continue;
         }
 
-        match.EnforceMemberTeam(player, CsTeam.None);
+        // Defer team seat + respawn: EnforceMemberTeam(…, None) + immediate
+        // Respawn on connect-full places the pawn before spawn anchors exist
+        // (air / under map). Read the real team after a short delay.
+        CCSPlayerController connecting = player;
+        TimerUtility.AddTimer(
+            0.4f,
+            () =>
+            {
+                if (!connecting.IsValid)
+                {
+                    return;
+                }
+
+                MatchManager? current = _matchService.GetCurrentMatch();
+                current?.EnforceMemberTeam(connecting);
+            }
+        );
 
         _matchEvents.PublishGameEvent(
             "player-connected",
@@ -193,9 +209,10 @@ public partial class FiveStackPlugin
         // jointeam 0 (auto) and wrong-side picks used to Hit Stop while
         // sv_disable_teamselect_menu is on in knife/live — players got stuck
         // unassigned with no way to pick. Force the roster side instead.
+        // Pass null so we read player.Team (not fake None → respawn storm).
         if (joiningTeam == CsTeam.None || joiningTeam != expectedTeam)
         {
-            match.EnforceMemberTeam(player, CsTeam.None);
+            match.EnforceMemberTeam(player);
             return HookResult.Stop;
         }
 

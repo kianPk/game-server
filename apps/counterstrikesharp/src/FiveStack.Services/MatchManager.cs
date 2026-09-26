@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using CounterStrikeSharp.API;
@@ -20,6 +21,10 @@ public class MatchManager
     // Extra seconds added to mp_match_restart_delay on dedicated servers so CS2's
     // auto-restart stays behind the plugin's stop-recording + demo-upload flow.
     private const int DemoUploadRestartBufferSeconds = 300;
+
+    // Prevent ChangeTeam retry storms from stacking Respawn() on first connect —
+    // that places the pawn at a fallback origin (air / under the map).
+    private static readonly ConcurrentDictionary<ulong, float> LastForcedRespawnAt = new();
 
     private MatchData? _matchData;
     private eMapStatus _currentMapStatus = eMapStatus.Unknown;
@@ -1155,6 +1160,34 @@ public class MatchManager
             IsWarmup()
             || (MatchUtility.Rules()?.FreezePeriod == true) && expectedTeam != CsTeam.Spectator;
 
+        void RespawnOnceSettled()
+        {
+            if (!player.IsValid || expectedTeam == CsTeam.Spectator)
+            {
+                return;
+            }
+
+            if (player.Team != expectedTeam)
+            {
+                return;
+            }
+
+            float now = Server.CurrentTime;
+            if (
+                LastForcedRespawnAt.TryGetValue(player.SteamID, out float last)
+                && now - last < 2.0f
+            )
+            {
+                return;
+            }
+
+            LastForcedRespawnAt[player.SteamID] = now;
+            _logger.LogInformation(
+                $"[team] Respawning {player.PlayerName} ({player.SteamID}) on {expectedTeam}"
+            );
+            player.Respawn();
+        }
+
         if (currentTeam != expectedTeam)
         {
             _logger.LogInformation(
@@ -1163,7 +1196,8 @@ public class MatchManager
 
             // Late joins during knife/live often miss a single early ChangeTeam
             // while teamselect is disabled — retry until the side sticks.
-            float[] delays = { 0.1f, 0.5f, 1.0f, 2.0f };
+            // Keep retries; only allow one Respawn after the team has landed.
+            float[] delays = { 0.15f, 0.75f, 1.5f };
 
             foreach (float delay in delays)
             {
@@ -1177,36 +1211,40 @@ public class MatchManager
                             return;
                         }
 
-                        if (player.Team == expectedTeam)
+                        if (player.Team != expectedTeam)
+                        {
+                            player.ChangeTeam(expectedTeam);
+                            _logger.LogInformation(
+                                $"[team] ChangeTeam applied {player.PlayerName} ({player.SteamID}) -> {expectedTeam} (delay={attemptDelay}s, now={player.Team})"
+                            );
+                        }
+
+                        if (!shouldRespawn)
                         {
                             return;
                         }
 
-                        player.ChangeTeam(expectedTeam);
-
-                        _logger.LogInformation(
-                            $"[team] ChangeTeam applied {player.PlayerName} ({player.SteamID}) -> {expectedTeam} (delay={attemptDelay}s, now={player.Team})"
-                        );
-
-                        // Respawn only once the team change has landed. Respawning
-                        // first spawns the player while still unassigned, and the
-                        // weapons a spawn creates are what the inventory plugin
-                        // skins — a spawn on the wrong team wastes that one shot.
-                        if (shouldRespawn && player.Team == expectedTeam)
+                        // Wait for ChangeTeam + spawn anchors (first connect).
+                        Server.NextFrame(() =>
                         {
-                            Server.NextFrame(() =>
-                            {
-                                if (!player.IsValid || player.Team != expectedTeam)
+                            TimerUtility.AddTimer(
+                                0.2f,
+                                () =>
                                 {
-                                    return;
-                                }
+                                    if (!player.IsValid)
+                                    {
+                                        return;
+                                    }
 
-                                _logger.LogInformation(
-                                    $"[team] Respawning {player.PlayerName} ({player.SteamID}) after team change -> {expectedTeam}"
-                                );
-                                player.Respawn();
-                            });
-                        }
+                                    if (player.Team != expectedTeam)
+                                    {
+                                        player.ChangeTeam(expectedTeam);
+                                    }
+
+                                    RespawnOnceSettled();
+                                }
+                            );
+                        });
                     }
                 );
             }
@@ -1219,10 +1257,12 @@ public class MatchManager
         }
         else if (shouldRespawn)
         {
-            _logger.LogInformation(
-                $"[team] Respawning {player.PlayerName} ({player.SteamID}) (already on {expectedTeam})"
-            );
-            player.Respawn();
+            // Immediate Respawn on connect-full races the pawn/map and often
+            // drops the player in the void or under the world.
+            Server.NextFrame(() =>
+            {
+                TimerUtility.AddTimer(0.35f, RespawnOnceSettled);
+            });
         }
 
         captainSystem.IsCaptain(player, expectedTeam);
