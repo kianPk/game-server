@@ -40,6 +40,7 @@ public class MatchService
                 "5stack.lan.cfg",
                 "5stack.warmup.cfg",
                 "5stack.wingman.cfg",
+                "5stack.rush.cfg",
             }
         )
         {

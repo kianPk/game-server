@@ -819,8 +819,12 @@ public class MatchManager
             return [];
         }
 
-        int gameMode =
-            _matchData.options.type == "Duel" || _matchData.options.type == "Wingman" ? 2 : 1;
+        int gameMode = _matchData.options.type switch
+        {
+            "Rush" => 6,
+            "Duel" or "Wingman" => 2,
+            _ => 1,
+        };
 
         return ["game_type 0", $"game_mode {gameMode}"];
     }
@@ -854,7 +858,7 @@ public class MatchManager
             return 10;
         }
 
-        // Prefer the actual roster so modes like Trios (3v3) do not fall through
+        // Prefer the actual roster so modes like Rush (3v3) do not fall through
         // to the Competitive default of 10.
         int rosterCount =
             (_matchData.lineup_1?.lineup_players?.Count ?? 0)
@@ -868,7 +872,7 @@ public class MatchManager
         {
             "Wingman" => 4,
             "Duel" => 2,
-            "Trios" => 6,
+            "Rush" or "Trios" => 6,
             _ => 10,
         };
     }

@@ -350,6 +350,12 @@ public class GameBackUpRounds
 
     private bool CanRestoreRound(int round)
     {
+        if (_matchService.GetCurrentMatch()?.GetMatchData()?.options.type == "Rush")
+        {
+            _logger.LogWarning($"Restore round {round} blocked: Rush matches cannot restore rounds");
+            return false;
+        }
+
         int connectedPlayers = MatchUtility.Players().Count;
         int expectedPlayers = _matchService.GetCurrentMatch()?.GetExpectedPlayerCount() ?? 10;
 
